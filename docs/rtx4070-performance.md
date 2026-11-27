@@ -1,8 +1,7 @@
 # RTX 4070 performance work
 
 Select `-Machine 4070` for the RTX 4070 / Ryzen 7 7800X3D / 32 GB
-machine. Automatic selection gives it to NVIDIA cards with less than 16 GB
-(read with `nvidia-smi`); larger NVIDIA cards keep the 4090 profile. The 4070
+machine. Automatic selection uses the existing vendor profiles. The 4070
 profile keeps the console
 selection (Series X by default), output mode, texture mip policy, and the
 four-shader wave64 allowlist unchanged.
