@@ -654,6 +654,134 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
 #[repr(C, align(16))]
 pub(crate) struct Aligned16(pub(crate) CONTEXT);
 
+/// What one function's unwind data says `RtlVirtualUnwind` reads: the
+/// bytes of the frame from its base up to and including the return address,
+/// and the frame register (number, scaled offset) if the prolog has set it
+/// by `in_prolog` (`None`: past the prolog).
+#[derive(Debug, PartialEq, Eq)]
+struct Reach {
+    bytes: u64,
+    frame: Option<(u8, u8)>,
+}
+
+/// [`Reach`] from an `UNWIND_INFO` and the infos it chains to (`chained`
+/// gives the bytes of a chained one by its RVA). `None` for a version this
+/// does not read, codes past the data, or too long a chain.
+fn reach_of(
+    info: &[u8],
+    in_prolog: Option<u32>,
+    chained: &dyn Fn(u32) -> Option<Vec<u8>>,
+) -> Option<Reach> {
+    let mut reach = Reach {
+        bytes: 8,
+        frame: None,
+    };
+    let mut info = info.to_vec();
+    for depth in 0..8 {
+        let &[head, _prolog, count, frame] = info.get(..4)? else {
+            return None;
+        };
+        let (version, flags) = (head & 7, head >> 3);
+        if !(1..=2).contains(&version) {
+            return None;
+        }
+        let count = usize::from(count);
+        let code = |i: usize| -> Option<u16> {
+            let at = 4 + 2 * i;
+            Some(u16::from_le_bytes(info.get(at..at + 2)?.try_into().ok()?))
+        };
+        let mut i = 0;
+        while i < count {
+            let c = code(i)?;
+            let (offset, op, op_info) = (u32::from(c & 0xff), (c >> 8) & 0xf, (c >> 12) as u64);
+            let (slots, bytes) = match op {
+                0 => (1, 8),
+                1 if op_info == 0 => (2, u64::from(code(i + 1)?) * 8),
+                1 => (3, u64::from(code(i + 1)?) | u64::from(code(i + 2)?) << 16),
+                2 => (1, op_info * 8 + 8),
+                3 => {
+                    // The frame register counts once this code has run.
+                    let set = depth == 0 && in_prolog.is_none_or(|at| offset <= at);
+                    if set && frame & 0xf != 0 {
+                        reach.frame = Some((frame & 0xf, frame >> 4));
+                    }
+                    (1, 0)
+                }
+                4 | 6 | 8 => (2, 0),
+                5 | 7 | 9 => (3, 0),
+                10 => (1, 40 + 8 * op_info),
+                _ => return None,
+            };
+            reach.bytes = reach.bytes.saturating_add(bytes);
+            i += slots;
+        }
+        if flags & 4 == 0 {
+            return Some(reach);
+        }
+        // A chained entry follows the codes, at an even count.
+        let at = 4 + 2 * (count + count % 2) + 8;
+        let rva = u32::from_le_bytes(info.get(at..at + 4)?.try_into().ok()?);
+        info = chained(rva)?;
+    }
+    None
+}
+
+/// [`Reach`] for `entry`, as addresses: the frame's base (the frame
+/// register less its offset when the prolog has set it, else `rsp`) and the
+/// bytes from there that the unwind reads.
+///
+/// # Safety
+///
+/// `entry` is a non-null entry of `image`'s function table.
+unsafe fn frame_reach(
+    image: u64,
+    entry: *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    context: &CONTEXT,
+) -> Option<(u64, u64)> {
+    // The entry's three dwords: begin, end, unwind info.
+    // SAFETY: the caller's entry, 12 bytes.
+    let [begin, _, unwind] = unsafe { entry.cast::<[u32; 3]>().read_unaligned() };
+    let bytes_at = |rva: u32| -> Option<Vec<u8>> {
+        let at = image.checked_add(u64::from(rva & !1))? as *const u8;
+        // SAFETY: unwind data inside the image the system registered; the
+        // header says how many codes follow, and a chain adds one entry.
+        unsafe {
+            let count = usize::from(at.add(2).read());
+            let chain = if at.read() >> 3 & 4 != 0 { 12 } else { 0 };
+            Some(std::slice::from_raw_parts(at, 4 + 2 * (count + count % 2) + chain).to_vec())
+        }
+    };
+    let info = bytes_at(unwind)?;
+    let into = context.Rip.checked_sub(image + u64::from(begin))?;
+    let in_prolog = (into < u64::from(info[1])).then_some(into as u32);
+    let reach = reach_of(&info, in_prolog, &bytes_at)?;
+    let base = match reach.frame {
+        Some((register, offset)) => {
+            let value = [
+                context.Rax,
+                context.Rcx,
+                context.Rdx,
+                context.Rbx,
+                context.Rsp,
+                context.Rbp,
+                context.Rsi,
+                context.Rdi,
+                context.R8,
+                context.R9,
+                context.R10,
+                context.R11,
+                context.R12,
+                context.R13,
+                context.R14,
+                context.R15,
+            ][usize::from(register)];
+            value.checked_sub(16 * u64::from(offset))?
+        }
+        None => context.Rsp,
+    };
+    Some((base, reach.bytes))
+}
+
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
@@ -678,6 +806,19 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // `RtlVirtualUnwind` reads the frame from its base up to the
+            // return address, and from the frame register once the prolog
+            // has set it: not only at `rsp`. Another thread's frame register
+            // can hold anything, and a frame near the top of its stack can
+            // reach past it (the profiler faulted reading reserved memory
+            // there). Stop where those reads would leave the stack.
+            // SAFETY: a non-null entry the lookup gave for `image`.
+            let Some((base, bytes)) = (unsafe { frame_reach(image, entry, context) }) else {
+                break;
+            };
+            if base < low as u64 || base.saturating_add(bytes) > high as u64 {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
@@ -797,6 +938,74 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    /// `push rbp; sub rsp, 0x28`: the return address, the push, the frame.
+    const PLAIN: [u8; 8] = [0x01, 5, 2, 0x00, 0x05, 0x42, 0x01, 0x50];
+    /// `push rbp; mov rbp, rsp; sub rsp, 0x20`, rbp the frame register.
+    const FRAMED: [u8; 10] = [0x01, 8, 3, 0x05, 0x08, 0x32, 0x04, 0x03, 0x01, 0x50];
+
+    fn none(_: u32) -> Option<Vec<u8>> {
+        None
+    }
+
+    #[test]
+    fn reach_counts_pushes_allocations_and_the_return_address() {
+        assert_eq!(
+            reach_of(&PLAIN, None, &none),
+            Some(Reach {
+                bytes: 8 + 8 + 0x28,
+                frame: None
+            })
+        );
+        // `sub rsp, 0x2000` as a large allocation in eighths.
+        let large = [0x01, 7, 2, 0x00, 0x07, 0x01, 0x00, 0x04];
+        assert_eq!(
+            reach_of(&large, None, &none),
+            Some(Reach {
+                bytes: 8 + 0x2000,
+                frame: None
+            })
+        );
+    }
+
+    #[test]
+    fn reach_takes_the_frame_register_once_the_prolog_set_it() {
+        assert_eq!(
+            reach_of(&FRAMED, None, &none),
+            Some(Reach {
+                bytes: 8 + 8 + 0x20,
+                frame: Some((5, 0))
+            })
+        );
+        // After the push only: rbp is still the caller's.
+        assert_eq!(
+            reach_of(&FRAMED, Some(1), &none).map(|r| r.frame),
+            Some(None)
+        );
+        assert_eq!(
+            reach_of(&FRAMED, Some(4), &none).map(|r| r.frame),
+            Some(Some((5, 0)))
+        );
+    }
+
+    #[test]
+    fn reach_follows_a_chain_and_refuses_what_it_cannot_read() {
+        // One push, padded to an even count, then the chained entry.
+        let mut head = vec![0x01 | 4 << 3, 1, 1, 0x00, 0x01, 0x50, 0, 0];
+        head.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0, 0]);
+        let chained = |rva: u32| (rva == 0x100).then(|| PLAIN.to_vec());
+        assert_eq!(
+            reach_of(&head, None, &chained),
+            Some(Reach {
+                bytes: 8 + 8 + 8 + 0x28,
+                frame: None
+            })
+        );
+        assert_eq!(reach_of(&head, None, &none), None);
+        assert_eq!(reach_of(&[0x03, 0, 0, 0], None, &none), None);
+        // Codes past the data.
+        assert_eq!(reach_of(&[0x01, 5, 4, 0x00, 0x05, 0x42], None, &none), None);
     }
 
     #[test]
