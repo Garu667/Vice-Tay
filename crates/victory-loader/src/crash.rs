@@ -654,10 +654,11 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
 #[repr(C, align(16))]
 pub(crate) struct Aligned16(pub(crate) CONTEXT);
 
-/// What one function's unwind data says `RtlVirtualUnwind` reads: the
-/// bytes of the frame from its base up to and including the return address,
-/// and the frame register (number, scaled offset) if the prolog has set it
-/// by `in_prolog` (`None`: past the prolog).
+/// What one function's unwind data says `RtlVirtualUnwind` reads, from the
+/// frame's base: `bytes` covers the frame up to and including the return
+/// address and every saved register it restores; `frame` is the frame
+/// register (number, scaled offset) if the prolog has set it by `in_prolog`
+/// (`None`: past the prolog).
 #[derive(Debug, PartialEq, Eq)]
 struct Reach {
     bytes: u64,
@@ -665,18 +666,20 @@ struct Reach {
 }
 
 /// [`Reach`] from an `UNWIND_INFO` and the infos it chains to (`chained`
-/// gives the bytes of a chained one by its RVA). `None` for a version this
-/// does not read, codes past the data, or too long a chain.
-fn reach_of(
-    info: &[u8],
+/// gives a chained one's bytes by its RVA, read in place). `None` for a
+/// version or code this does not read, codes past the data, or too long a
+/// chain. Allocates nothing: the profiler calls it with another thread
+/// suspended, which may hold the heap.
+fn reach_of<'a>(
+    info: &'a [u8],
     in_prolog: Option<u32>,
-    chained: &dyn Fn(u32) -> Option<Vec<u8>>,
+    chained: &dyn Fn(u32) -> Option<&'a [u8]>,
 ) -> Option<Reach> {
-    let mut reach = Reach {
-        bytes: 8,
-        frame: None,
-    };
-    let mut info = info.to_vec();
+    let mut frame_register = None;
+    // Bytes the stack pointer moves while the unwind undoes pushes and
+    // allocations; the farthest byte a restore or machine frame reads.
+    let (mut moved, mut farthest) = (0u64, 0u64);
+    let mut info = info;
     for depth in 0..8 {
         let &[head, _prolog, count, frame] = info.get(..4)? else {
             return None;
@@ -690,33 +693,53 @@ fn reach_of(
             let at = 4 + 2 * i;
             Some(u16::from_le_bytes(info.get(at..at + 2)?.try_into().ok()?))
         };
+        let far = |i: usize| -> Option<u64> { Some(u64::from(code(i)?) | u64::from(code(i + 1)?) << 16) };
+        // A chained info's offsets are from where the unwind of the infos
+        // before it left the stack pointer.
+        let base = moved;
         let mut i = 0;
         while i < count {
             let c = code(i)?;
             let (offset, op, op_info) = (u32::from(c & 0xff), (c >> 8) & 0xf, (c >> 12) as u64);
-            let (slots, bytes) = match op {
-                0 => (1, 8),
-                1 if op_info == 0 => (2, u64::from(code(i + 1)?) * 8),
-                1 => (3, u64::from(code(i + 1)?) | u64::from(code(i + 2)?) << 16),
-                2 => (1, op_info * 8 + 8),
+            // Slots taken, bytes the stack pointer moves, and a read of
+            // (offset from the base, width).
+            let (slots, moves, read) = match op {
+                0 => (1, 8, None),
+                1 if op_info == 0 => (2, u64::from(code(i + 1)?) * 8, None),
+                1 => (3, far(i + 1)?, None),
+                2 => (1, op_info * 8 + 8, None),
                 3 => {
                     // The frame register counts once this code has run.
                     let set = depth == 0 && in_prolog.is_none_or(|at| offset <= at);
                     if set && frame & 0xf != 0 {
-                        reach.frame = Some((frame & 0xf, frame >> 4));
+                        frame_register = Some((frame & 0xf, frame >> 4));
                     }
-                    (1, 0)
+                    (1, 0, None)
                 }
-                4 | 6 | 8 => (2, 0),
-                5 | 7 | 9 => (3, 0),
-                10 => (1, 40 + 8 * op_info),
+                4 => (2, 0, Some((base + u64::from(code(i + 1)?) * 8, 8))),
+                5 => (3, 0, Some((base + far(i + 1)?, 8))),
+                // Version 1's 6 and 7 save an XMM register; version 2's 6 is an
+                // epilog mark that reads nothing.
+                6 if version == 2 => (2, 0, None),
+                6 | 8 => (2, 0, Some((base + u64::from(code(i + 1)?) * 16, 16))),
+                7 if version == 2 => return None,
+                7 | 9 => (3, 0, Some((base + far(i + 1)?, 16))),
+                // The machine frame where the stack pointer is now: rip, cs,
+                // eflags, rsp, ss, after an error code with info 1.
+                10 => (1, 0, Some((moved, 40 + 8 * op_info))),
                 _ => return None,
             };
-            reach.bytes = reach.bytes.saturating_add(bytes);
+            if let Some((at, width)) = read {
+                farthest = farthest.max(at.saturating_add(width));
+            }
+            moved = moved.saturating_add(moves);
             i += slots;
         }
         if flags & 4 == 0 {
-            return Some(reach);
+            return Some(Reach {
+                bytes: moved.saturating_add(8).max(farthest),
+                frame: frame_register,
+            });
         }
         // A chained entry follows the codes, at an even count.
         let at = 4 + 2 * (count + count % 2) + 8;
@@ -724,6 +747,52 @@ fn reach_of(
         info = chained(rva)?;
     }
     None
+}
+
+/// The image's size by its PE headers, or `None` if `image` does not start
+/// with them.
+///
+/// # Safety
+///
+/// `image` is the base of an image the system registered unwind data for.
+unsafe fn image_size(image: u64) -> Option<u64> {
+    let at = image as *const u8;
+    // SAFETY: the DOS header, then the NT headers it points to, inside the
+    // mapped image's headers; each is checked before the next is read.
+    unsafe {
+        if at.cast::<u16>().read_unaligned() != 0x5a4d {
+            return None;
+        }
+        let nt = at.add(at.add(0x3c).cast::<u32>().read_unaligned() as usize);
+        if nt.cast::<u32>().read_unaligned() != 0x4550 {
+            return None;
+        }
+        // `SizeOfImage` in the 64-bit optional header.
+        Some(u64::from(nt.add(0x50).cast::<u32>().read_unaligned()))
+    }
+}
+
+/// The unwind info at `rva` of an image `size` bytes long, read in place:
+/// its header, codes and chained entry, if all of it lies in the image.
+///
+/// # Safety
+///
+/// `image` is the base of a mapped image `size` bytes long.
+unsafe fn unwind_info_at(image: u64, size: u64, rva: u32) -> Option<&'static [u8]> {
+    let rva = u64::from(rva & !1);
+    if rva.checked_add(4)? > size {
+        return None;
+    }
+    let at = (image + rva) as *const u8;
+    // SAFETY: the header's four bytes lie in the image (checked above).
+    let (head, count) = unsafe { (at.read(), usize::from(at.add(2).read())) };
+    let chain = if head >> 3 & 4 != 0 { 12 } else { 0 };
+    let len = 4 + 2 * (count + count % 2) + chain;
+    if rva.checked_add(len as u64)? > size {
+        return None;
+    }
+    // SAFETY: `len` bytes from `at` lie in the mapped image (checked above).
+    Some(unsafe { std::slice::from_raw_parts(at, len) })
 }
 
 /// [`Reach`] for `entry`, as addresses: the frame's base (the frame
@@ -741,20 +810,14 @@ unsafe fn frame_reach(
     // The entry's three dwords: begin, end, unwind info.
     // SAFETY: the caller's entry, 12 bytes.
     let [begin, _, unwind] = unsafe { entry.cast::<[u32; 3]>().read_unaligned() };
-    let bytes_at = |rva: u32| -> Option<Vec<u8>> {
-        let at = image.checked_add(u64::from(rva & !1))? as *const u8;
-        // SAFETY: unwind data inside the image the system registered; the
-        // header says how many codes follow, and a chain adds one entry.
-        unsafe {
-            let count = usize::from(at.add(2).read());
-            let chain = if at.read() >> 3 & 4 != 0 { 12 } else { 0 };
-            Some(std::slice::from_raw_parts(at, 4 + 2 * (count + count % 2) + chain).to_vec())
-        }
-    };
-    let info = bytes_at(unwind)?;
+    // SAFETY: the image the lookup gave with `entry`.
+    let size = unsafe { image_size(image) }?;
+    // SAFETY: as above; each read is bounded by `size`.
+    let at = |rva: u32| unsafe { unwind_info_at(image, size, rva) };
+    let info = at(unwind)?;
     let into = context.Rip.checked_sub(image + u64::from(begin))?;
     let in_prolog = (into < u64::from(info[1])).then_some(into as u32);
-    let reach = reach_of(&info, in_prolog, &bytes_at)?;
+    let reach = reach_of(info, in_prolog, &at)?;
     let base = match reach.frame {
         Some((register, offset)) => {
             let value = [
@@ -945,7 +1008,7 @@ mod tests {
     /// `push rbp; mov rbp, rsp; sub rsp, 0x20`, rbp the frame register.
     const FRAMED: [u8; 10] = [0x01, 8, 3, 0x05, 0x08, 0x32, 0x04, 0x03, 0x01, 0x50];
 
-    fn none(_: u32) -> Option<Vec<u8>> {
+    fn none<'a>(_: u32) -> Option<&'a [u8]> {
         None
     }
 
@@ -990,11 +1053,31 @@ mod tests {
     }
 
     #[test]
+    fn reach_covers_the_saved_registers_it_restores() {
+        // `push rbp; sub rsp, 0x20; mov [rsp+0x18], rbx`: the save lies
+        // inside the frame, which still ends at the return address.
+        let inside = [0x01, 10, 4, 0x00, 0x0a, 0x34, 0x03, 0x00, 0x05, 0x32, 0x01, 0x50];
+        assert_eq!(reach_of(&inside, None, &none).map(|r| r.bytes), Some(8 + 0x20 + 8));
+        // At the frame's last eight bytes below the pushes: the boundary.
+        let edge = [0x01, 10, 4, 0x00, 0x0a, 0x34, 0x05, 0x00, 0x05, 0x32, 0x01, 0x50];
+        assert_eq!(reach_of(&edge, None, &none).map(|r| r.bytes), Some(8 + 0x20 + 8));
+        // A save past the frame (rbx at +0x48) widens the read to it.
+        let past = [0x01, 10, 4, 0x00, 0x0a, 0x34, 0x09, 0x00, 0x05, 0x32, 0x01, 0x50];
+        assert_eq!(reach_of(&past, None, &none).map(|r| r.bytes), Some(0x48 + 8));
+        // An XMM restore at +0x40, sixteen bytes wide.
+        let xmm = [0x01, 10, 4, 0x00, 0x0a, 0x68, 0x04, 0x00, 0x05, 0x32, 0x01, 0x50];
+        assert_eq!(reach_of(&xmm, None, &none).map(|r| r.bytes), Some(0x40 + 16));
+        // The far form, unscaled: rbx at +0x100.
+        let far = [0x01, 10, 4, 0x00, 0x0a, 0x35, 0x00, 0x01, 0x00, 0x00, 0x01, 0x50];
+        assert_eq!(reach_of(&far, None, &none).map(|r| r.bytes), Some(0x100 + 8));
+    }
+
+    #[test]
     fn reach_follows_a_chain_and_refuses_what_it_cannot_read() {
         // One push, padded to an even count, then the chained entry.
         let mut head = vec![0x01 | 4 << 3, 1, 1, 0x00, 0x01, 0x50, 0, 0];
         head.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0, 0]);
-        let chained = |rva: u32| (rva == 0x100).then(|| PLAIN.to_vec());
+        let chained = |rva: u32| (rva == 0x100).then_some(&PLAIN[..]);
         assert_eq!(
             reach_of(&head, None, &chained),
             Some(Reach {
