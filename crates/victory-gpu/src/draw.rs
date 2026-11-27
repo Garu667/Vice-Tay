@@ -3273,22 +3273,43 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        self.after_dispatch(list, p);
+        use crate::ambient::{Dispatched, Role, note_reflect};
+        let reflect = p.stages.first().and_then(|s| s.shader.ambient) == Some(Role::Reflect);
+        if reflect && (x == 0 || y == 0 || z == 0) {
+            // No groups: the resolve writes nothing, and the hold would
+            // rewrite the image's earlier contents.
+            if crate::ambient::holds() {
+                note_reflect(Dispatched::Empty);
+            }
+            if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
+                self.light_probe(list, p, true);
+            }
+        } else if self.after_dispatch(list, p) == Some(Role::Reflect) {
+            note_reflect(Dispatched::Direct);
+        }
     }
 
     /// What follows a dispatch of `p`, direct or indirect: the stand-in for
-    /// the indirect light and the light probe.
-    fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
+    /// the indirect light and the light probe. The stand-in's role, if it
+    /// recorded anything.
+    fn after_dispatch(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+    ) -> Option<crate::ambient::Role> {
+        let mut recorded = None;
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+            recorded = Some(role);
         }
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
         }
+        recorded
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -4666,12 +4687,19 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
-            // The reflections' resolve is dispatched so; the other roles
-            // keep to direct dispatches, as before.
-            if p.stages.first().and_then(|s| s.shader.ambient)
-                == Some(crate::ambient::Role::Reflect)
-            {
-                self.after_dispatch(list, p);
+            // Only the reflections' resolve is followed here; the other
+            // roles keep to direct dispatches, as before. Not after a count
+            // buffer: a count of 0 runs no resolve, and the hold would
+            // rewrite the image's earlier contents.
+            use crate::ambient::{Dispatched, Role, note_reflect};
+            if p.stages.first().and_then(|s| s.shader.ambient) == Some(Role::Reflect) {
+                if counter.is_some() {
+                    if crate::ambient::on() && crate::ambient::holds() {
+                        note_reflect(Dispatched::Counted);
+                    }
+                } else if self.after_dispatch(list, p) == Some(Role::Reflect) {
+                    note_reflect(Dispatched::Indirect);
+                }
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

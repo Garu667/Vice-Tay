@@ -688,6 +688,94 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
+/// How a resolve of the reflections was dispatched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dispatched {
+    /// `Dispatch`: held after it.
+    Direct,
+    /// `ExecuteIndirect` without a count buffer: held after it.
+    Indirect,
+    /// `ExecuteIndirect` with a count buffer: not held. The count is read on
+    /// the card and may be 0; the resolve then writes nothing, and a hold
+    /// would rewrite what the image held before.
+    Counted,
+    /// `Dispatch` of no groups: not held, for the same reason.
+    Empty,
+}
+
+/// Holds after direct and after uncounted indirect resolves, and counted
+/// and empty resolves left alone.
+static BY_DISPATCH: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether a hold would be recorded after a resolve now, as [`after`]
+/// checks it: for the counts of the resolves left alone.
+pub(crate) fn holds() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let constant = match set() {
+        Set::Off => return false,
+        Set::Estimate(_) => false,
+        Set::Constant(_) => true,
+    };
+    pass().is_some_and(|p| p.hold.is_some())
+        && !crate::pipeline::builder_runs()
+        && (constant || KEPT.load(Relaxed))
+}
+
+/// Frames after the first note before the counts are logged, and between
+/// later logs of them.
+const COUNTS_FIRST: u64 = 100;
+const COUNTS_EVERY: u64 = 1000;
+
+/// A resolve of the reflections, dispatched so: for `Direct` and `Indirect`
+/// one the hold followed, for `Counted` and `Empty` one it did not (noted
+/// only while [`holds`]).
+pub(crate) fn note_reflect(how: Dispatched) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    if how == Dispatched::Counted {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Relaxed) {
+            tracing::info!("reflections not held after a counted indirect dispatch");
+        }
+    }
+    if how == Dispatched::Empty {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Relaxed) {
+            tracing::info!("reflections not held after a dispatch of no groups");
+        }
+    }
+    BY_DISPATCH[how as usize].fetch_add(1, Relaxed);
+    static DUE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let frames = counts_due(
+        crate::frame::current(),
+        &mut DUE.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    if let Some(frames) = frames {
+        let [direct, indirect, counted, empty] = BY_DISPATCH.each_ref().map(|n| n.load(Relaxed));
+        tracing::info!(
+            frames,
+            direct,
+            indirect,
+            counted,
+            empty,
+            "reflections' resolves: held after a direct dispatch, held after an indirect one \
+             without a count, not held after a counted one or a direct one of no groups"
+        );
+    }
+}
+
+/// Whether the counts are due at frame `now` (`at`: the first note's frame
+/// and the frame they are next due), and how many frames after the first
+/// note it is.
+fn counts_due(now: u64, at: &mut Option<(u64, u64)>) -> Option<u64> {
+    let (first, next) = *at.get_or_insert((now, now + COUNTS_FIRST));
+    if now < next {
+        return None;
+    }
+    *at = Some((first, now + COUNTS_EVERY));
+    Some(now - first)
+}
+
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -871,5 +959,20 @@ mod tests {
         let source = format!("#define HOLD\n{SOURCE}");
         let code = crate::host::compile(&source, s!("hold"), s!("cs_5_1")).expect("the hold");
         assert!(!code.is_empty());
+    }
+
+    #[test]
+    fn counts_by_dispatch_are_due_after_the_first_note_then_every_so_often() {
+        let mut at = None;
+        assert_eq!(counts_due(50, &mut at), None);
+        assert_eq!(counts_due(50 + COUNTS_FIRST - 1, &mut at), None);
+        assert_eq!(counts_due(50 + COUNTS_FIRST, &mut at), Some(COUNTS_FIRST));
+        assert_eq!(counts_due(50 + COUNTS_FIRST + 1, &mut at), None);
+        let later = 50 + COUNTS_FIRST + COUNTS_EVERY;
+        assert_eq!(
+            counts_due(later, &mut at),
+            Some(COUNTS_FIRST + COUNTS_EVERY)
+        );
+        assert_eq!(counts_due(later + 1, &mut at), None);
     }
 }
