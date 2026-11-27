@@ -1,7 +1,8 @@
 # RTX 4070 performance work
 
 Select `-Machine 4070` for the RTX 4070 / Ryzen 7 7800X3D / 32 GB
-machine. Automatic selection uses the existing vendor profiles. The 4070
+machine. Automatic selection gives it to NVIDIA cards with less than 16 GB
+(read with `nvidia-smi`); larger NVIDIA cards keep the 4090 profile. The 4070
 profile keeps the console
 selection (Series X by default), output mode, texture mip policy, and the
 four-shader wave64 allowlist unchanged.
@@ -109,3 +110,31 @@ the preset, a longer acceleration toward the shore averaged 17.60 FPS over
 33.06 seconds and one interval dropped to 3.51 FPS. The boats reached different
 positions during the longer run. Sustained 20 FPS through shoreline streaming
 and longer-session behavior still need validation.
+
+## Series S check on an RTX 3080 10 GB (2026-11-27)
+
+An RTX 3080 10 GB (driver 610.88, Windows 11 26200), Core i5-13600K
+(6 performance and 8 efficient cores, 20 threads), and 32 GB of RAM ran the
+Series S profile from `0ef44bc`, diagnostics build, full screen, in the prison
+cell: the character standing at the window for three minutes. Each row is one
+run. FPS is the median of the last 60 once-a-second frame lines in the world
+(3 to 29 fps, 4,300 to 4,500 draws a frame); the pipelines the first run drew
+with were made by `warm --used` before the others.
+
+| Run | Settings | FPS median | p10 | ms a frame: preparing / on the GPU / copying back | Peak VRAM | GPU busy |
+|---|---|---:|---:|---|---:|---:|
+| 1 | automatic (the 4090 profile), cold pipeline cache | 7.3 | 6.4 | 55 / 66 / 49 | 5.8 GB | 82 % |
+| 2 | `-Machine 4070` | **14.4** | 12.8 | 47 / 6 / 35 | 7.3 GB | 69 % |
+| 3 | `-Machine 4070`, `VICTORY_D3D12_DRED=0`, `VICTORY_OUTPUT=1920x1080` | 15.2 | 14.2 | 47 / 7 / 30 | 7.2 GB | 71 % |
+| 4 | as 3, with `VICTORY_PLACED_ORDER=1` | 14.6 | 10.7 | 46 / 7 / 30 | 7.6 GB | 73 % |
+
+The 4070 profile doubles the frame rate on this card: with the 4090 profile
+the card spends 66 ms a frame (busy 82 % for 7 fps), most likely reading
+title buffers that the 4090 profile leaves in system memory over PCIe; the
+4070 profile's 64 KiB minimum and 1,536 MiB budget for card-resident buffers
+fit in 10 GB here (7.3 GB at most). Run 1 also had a cold pipeline cache,
+which drops draws but should not account for 59 ms of card time.
+`VICTORY_PLACED_ORDER=1` (from the 4090 profile) did not help on this machine.
+With the 4070 profile the card is 70 % busy: the limit is now the CPU side
+(preparing about 47 ms and copying back 30 to 35 ms a frame). No device was
+lost in any run. Open-world streaming and longer sessions are not covered yet.

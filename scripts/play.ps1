@@ -6,7 +6,7 @@
 # -NoPanel      without the performance panel (on by default, F3 hides it while playing)
 # -Console      series-x (the default) or series-s: the console the title takes this PC for
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070 or 4090
+# -Machine      auto (the default: by the graphics card; NVIDIA under 16 GB gets 4070), 7900xtx, 4070 or 4090
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -30,9 +30,22 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
+    # By vendor; NVIDIA cards under 16 GB get the 4070 profile below.
     $cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.PNPDeviceID })
     $Machine = if ($cards -match 'VEN_10DE') { '4090' } else { '7900xtx' }
+    if ($Machine -eq '4090') {
+        # NVIDIA cards under 16 GB take the 4070 profile: on an RTX 3080 10 GB
+        # (Series S, the cell) the 4090 profile ran 7.3 fps with 66 ms of card
+        # a frame, the 4070 profile 14.4 fps with 6 ms (docs/rtx4070-performance.md).
+        # Win32_VideoController's AdapterRAM stops at 4 GB; the driver's own tool says it.
+        $mib = 0
+        $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+        if ($smi) {
+            $mib = (& $smi.Source --query-gpu=memory.total --format=csv,noheader,nounits 2>$null |
+                ForEach-Object { [int]"$_".Trim() } | Measure-Object -Maximum).Maximum
+        }
+        if ($mib -gt 0 -and $mib -lt 16000) { $Machine = '4070' }
+    }
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one

@@ -179,7 +179,7 @@ PowerShell asks for the executable's path.
 | `-NoPanel` | Start without the performance panel |
 | `-Windowed` | Start in a window |
 | `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile every session uses |
-| `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
+| `-Machine 4090` / `4070` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090; `4070` is picked automatically for NVIDIA cards under 16 GB) or AMD |
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
 | `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
 | `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
