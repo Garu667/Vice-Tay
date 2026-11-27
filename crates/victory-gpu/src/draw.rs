@@ -3284,7 +3284,7 @@ impl State {
             if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
                 self.light_probe(list, p, true);
             }
-        } else if self.after_dispatch(list, p) == Some(Role::Reflect) {
+        } else if self.after_dispatch(list, p, None) == Some(Role::Reflect) {
             note_reflect(Dispatched::Direct);
         }
     }
@@ -3296,11 +3296,12 @@ impl State {
         &mut self,
         list: &HostList,
         p: &HostPipeline,
+        indirect: Option<crate::ambient::IndirectHold<'_>>,
     ) -> Option<crate::ambient::Role> {
         let mut recorded = None;
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
-            && self.ambient(list, p, role)
+            && self.ambient(list, p, role, indirect)
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
@@ -3314,7 +3315,13 @@ impl State {
 
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
-    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+    fn ambient(
+        &self,
+        list: &HostList,
+        p: &HostPipeline,
+        role: crate::ambient::Role,
+        indirect: Option<crate::ambient::IndirectHold<'_>>,
+    ) -> bool {
         use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
@@ -3349,12 +3356,13 @@ impl State {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
-        crate::ambient::after(list, role, &Views {
+        let views = Views {
             image,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+        };
+        crate::ambient::after(list, role, &views, indirect)
     }
 
     /// The view a shader of the bound pipeline reads through a table, at
@@ -4688,17 +4696,23 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             // Only the reflections' resolve is followed here; the other
-            // roles keep to direct dispatches, as before. Not after a count
-            // buffer: a count of 0 runs no resolve, and the hold would
-            // rewrite the image's earlier contents.
-            use crate::ambient::{Dispatched, Role, note_reflect};
+            // roles keep to direct dispatches. A single uncounted record
+            // can be checked inside the hold, using the clamped dimensions.
+            use crate::ambient::{Dispatched, IndirectHold, Role, note_reflect};
             if p.stages.first().and_then(|s| s.shader.ambient) == Some(Role::Reflect) {
                 if counter.is_some() {
                     if crate::ambient::on() && crate::ambient::holds() {
                         note_reflect(Dispatched::Counted);
                     }
-                } else if self.after_dispatch(list, p) == Some(Role::Reflect) {
-                    note_reflect(Dispatched::Indirect);
+                } else if max == 1 {
+                    if let Ok(at) = u32::try_from(at)
+                        && self.after_dispatch(list, p, Some(IndirectHold { buffer: &bounded, at }))
+                            == Some(Role::Reflect)
+                    {
+                        note_reflect(Dispatched::Indirect);
+                    }
+                } else if max > 1 && crate::ambient::on() && crate::ambient::holds() {
+                    note_reflect(Dispatched::Multiple);
                 }
             }
         } else {

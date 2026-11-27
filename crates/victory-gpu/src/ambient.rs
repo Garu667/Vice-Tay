@@ -44,14 +44,16 @@
 //! diffuse light has it), hue kept ([`reflect`]). Ported from Serph91P's
 //! avatarmanz/VIctory-7900XTX#314 (6c7e3a87, GPL-3.0); that the reflections
 //! can be held to the ambient light, and the switch's name, are beloooo's
-//! (VIctory-Belobug-AMD 44dcd437).
+//! (VIctory-Belobug-AMD 44dcd437). For uncounted indirect calls with one
+//! record, the hold checks its clamped dimensions on the GPU. Counted and
+//! multiple-record indirect calls are left alone.
 
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host};
+use crate::host::{HostList, host, transition};
 
 /// Programs of the title the stand-in follows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -325,7 +327,11 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
+#ifdef HOLD_INDIRECT
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), SRV(t1)"
+#else
 #define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#endif
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -336,6 +342,9 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; float least;
+#ifdef HOLD_INDIRECT
+    uint indirect_at;
+#endif
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -456,7 +465,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#if defined(RAISE) || defined(HOLD)
+#if defined(RAISE) || defined(HOLD) || defined(HOLD_INDIRECT)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -472,13 +481,19 @@ uint pack(float3 c) {
 }
 #endif
 
-#ifdef HOLD
+#if defined(HOLD) || defined(HOLD_INDIRECT)
+#ifdef HOLD_INDIRECT
+ByteAddressBuffer bounded : register(t1);
+#endif
 // The reflections: no brighter than `most` times the light around, as the
 // estimate has it at the four points about the texel (with a fifth of the
 // room's slow mean), or the constant.
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void hold(uint3 at : SV_DispatchThreadID) {
+#ifdef HOLD_INDIRECT
+    if (any(bounded.Load3(indirect_at) == 0)) return;
+#endif
     uint w, h;
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
@@ -605,6 +620,7 @@ struct Pass {
     air: ID3D12PipelineState,
     /// Made only while the hold of the reflections is on.
     hold: Option<ID3D12PipelineState>,
+    hold_indirect: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -614,17 +630,23 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(
+    device: &ID3D12Device,
+    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+    reflection_hold: bool,
+) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let mut indirect_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let root = if part == "HOLD_INDIRECT" { &mut indirect_root } else { &mut root };
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                *root = Some(device.CreateRootSignature(0, &code)?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
+                pRootSignature: std::mem::transmute_copy(root),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
                 ..Default::default()
             };
@@ -639,9 +661,16 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     // Not made unless the hold is on, and on its own: without it the rest
     // of the stand-in still runs.
-    let hold = if !reflect_in().is_empty() {
+    let hold = if reflection_hold {
         pipeline("HOLD", s!("hold"))
             .inspect_err(|e| tracing::warn!(%e, "no hold of the reflections"))
+            .ok()
+    } else {
+        None
+    };
+    let hold_indirect = if reflection_hold {
+        pipeline("HOLD_INDIRECT", s!("hold"))
+            .inspect_err(|e| tracing::warn!(%e, "no hold after indirect reflection resolves"))
             .ok()
     } else {
         None
@@ -656,6 +685,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         hold,
+        hold_indirect: indirect_root.zip(hold_indirect),
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -666,7 +696,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer(bytes), !reflect_in().is_empty())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -693,7 +723,7 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 pub(crate) enum Dispatched {
     /// `Dispatch`: held after it.
     Direct,
-    /// `ExecuteIndirect` without a count buffer: held after it.
+    /// A GPU-gated hold was recorded after one uncounted indirect record.
     Indirect,
     /// `ExecuteIndirect` with a count buffer: not held. The count is read on
     /// the card and may be 0; the resolve then writes nothing, and a hold
@@ -701,12 +731,13 @@ pub(crate) enum Dispatched {
     Counted,
     /// `Dispatch` of no groups: not held, for the same reason.
     Empty,
+    /// An uncounted call with more than one record was left alone.
+    Multiple,
 }
 
-/// Holds after direct and after uncounted indirect resolves, and counted
-/// and empty resolves left alone.
-static BY_DISPATCH: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Direct holds, GPU-gated indirect holds recorded, and resolves left alone.
+static BY_DISPATCH: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Whether a hold would be recorded after a resolve now, as [`after`]
 /// checks it: for the counts of the resolves left alone.
@@ -717,7 +748,7 @@ pub(crate) fn holds() -> bool {
         Set::Estimate(_) => false,
         Set::Constant(_) => true,
     };
-    pass().is_some_and(|p| p.hold.is_some())
+    pass().is_some_and(|p| p.hold.is_some() || p.hold_indirect.is_some())
         && !crate::pipeline::builder_runs()
         && (constant || KEPT.load(Relaxed))
 }
@@ -727,9 +758,7 @@ pub(crate) fn holds() -> bool {
 const COUNTS_FIRST: u64 = 100;
 const COUNTS_EVERY: u64 = 1000;
 
-/// A resolve of the reflections, dispatched so: for `Direct` and `Indirect`
-/// one the hold followed, for `Counted` and `Empty` one it did not (noted
-/// only while [`holds`]).
+/// The recorded path for a reflection resolve while [`holds`].
 pub(crate) fn note_reflect(how: Dispatched) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     if how == Dispatched::Counted {
@@ -751,15 +780,16 @@ pub(crate) fn note_reflect(how: Dispatched) {
         &mut DUE.lock().unwrap_or_else(|e| e.into_inner()),
     );
     if let Some(frames) = frames {
-        let [direct, indirect, counted, empty] = BY_DISPATCH.each_ref().map(|n| n.load(Relaxed));
+        let [direct, indirect_gated, counted, empty, multiple] = BY_DISPATCH.each_ref().map(|n| n.load(Relaxed));
         tracing::info!(
             frames,
             direct,
-            indirect,
+            indirect_gated,
             counted,
             empty,
-            "reflections' resolves: held after a direct dispatch, held after an indirect one \
-             without a count, not held after a counted one or a direct one of no groups"
+            multiple,
+            "reflections' resolves: direct holds, GPU-gated indirect holds recorded, \
+             and counted, empty direct, or multiple-record indirect resolves left alone"
         );
     }
 }
@@ -791,10 +821,40 @@ pub(crate) struct Views {
     pub(crate) slices: u32,
 }
 
+/// The exact dispatch arguments produced by either indirect clamp.
+#[derive(Clone, Copy)]
+pub(crate) struct IndirectHold<'a> {
+    pub(crate) buffer: &'a ID3D12Resource,
+    pub(crate) at: u32,
+}
+
+impl IndirectHold<'_> {
+    fn run(self, list: &ID3D12GraphicsCommandList, pso: &ID3D12PipelineState, groups: [u32; 2]) {
+        let arguments = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // SAFETY: the open list owns the buffer, and the clamp left it in
+        // INDIRECT_ARGUMENT. Restore that state for reuse and list teardown.
+        unsafe {
+            list.ResourceBarrier(&[transition(self.buffer, arguments, readable)]);
+            list.SetComputeRoot32BitConstant(0, self.at, 16);
+            list.SetComputeRootShaderResourceView(6, self.buffer.GetGPUVirtualAddress());
+            list.SetPipelineState(pso);
+            list.Dispatch(groups[0], groups[1], 1);
+            list.ResourceBarrier(&[transition(self.buffer, readable, arguments)]);
+        }
+        uav_barrier(list);
+    }
+}
+
 /// After the title's program of that role, in `list` with the program's view
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
-pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+pub(crate) fn after(
+    list: &HostList,
+    role: Role,
+    views: &Views,
+    indirect: Option<IndirectHold<'_>>,
+) -> bool {
     use std::sync::atomic::Ordering;
     let Some(pass) = pass() else {
         return false;
@@ -812,13 +872,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     if role == Role::Reflect {
         // The traced reflections are the title's own while its rays run.
-        if pass.hold.is_none() || crate::pipeline::builder_runs() {
+        let can_hold = if indirect.is_some() { pass.hold_indirect.is_some() } else { pass.hold.is_some() };
+        if !can_hold || crate::pipeline::builder_runs() {
             return false;
         }
         // Its own line: the four below are taken by the others first.
         static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !HELD.swap(true, Ordering::Relaxed) {
-            tracing::info!(size = ?views.size, "the reflections are held after their resolve");
+            tracing::info!(size = ?views.size, "the reflection hold is enabled");
         }
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -854,13 +915,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     let l = &list.list;
+    let indirect = indirect.and_then(|args| pass.hold_indirect.as_ref().map(|(root, pso)| (args, root, pso)));
+    let root = indirect.map_or(&pass.root, |(_, root, _)| root);
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.
     unsafe {
         uav_barrier(l);
-        l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        l.SetComputeRootSignature(root);
+        l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -879,9 +942,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Reflect => {
-                if let Some(hold) = &pass.hold {
-                    let [w, h] = views.size;
-                    run(hold, w.div_ceil(8), h.div_ceil(8), 1);
+                let groups = views.size.map(|size| size.div_ceil(8));
+                if let Some((args, _, pso)) = indirect {
+                    args.run(l, pso, groups);
+                } else if let Some(hold) = &pass.hold {
+                    run(hold, groups[0], groups[1], 1);
                 }
             }
             Role::Resolve => {
@@ -949,7 +1014,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), true).expect("the passes");
     }
 
     /// The hold of the reflections compiles with the system's compiler too
@@ -959,6 +1024,163 @@ mod tests {
         let source = format!("#define HOLD\n{SOURCE}");
         let code = crate::host::compile(&source, s!("hold"), s!("cs_5_1")).expect("the hold");
         assert!(!code.is_empty());
+    }
+
+    #[test]
+    fn indirect_hold_only_changes_the_texture_after_nonempty_dispatches() {
+        use crate::indirect::tests::WarpHarness;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+        use windows::core::Interface;
+
+        let debug = crate::switch::on("VICTORY_D3D12_DEBUG");
+        if debug {
+            // SAFETY: the debug layer is enabled before creating the device.
+            unsafe {
+                let mut layer: Option<ID3D12Debug> = None;
+                D3D12GetDebugInterface(&mut layer).expect("the D3D12 debug interface");
+                layer.expect("the D3D12 debug layer").EnableDebugLayer();
+            }
+        }
+        let mut warp = WarpHarness::new().expect("a D3D12 WARP adapter");
+        let pass = make(&warp.device, |bytes| Some(warp.default_uav(bytes)), true).unwrap();
+        let (root, pso) = pass.hold_indirect.as_ref().expect("the guarded hold PSO");
+        let (initial, initial_bytes, _) = warp.shared_buffer(256);
+        let (readback, readback_bytes, _) = warp.shared_buffer(256);
+        let (records, records_bytes, _) = warp.shared_buffer(64);
+        let (oversized, oversized_bytes, _) = warp.shared_buffer(12);
+        let (_budget, budget_bytes, budget) = warp.shared_buffer(256);
+        let clamped = warp.default_uav(12);
+        let mut words = [0u32; 16];
+        words[1] = 1.0f32.to_bits();
+        words[9] = 0.25f32.to_bits();
+        const BRIGHT: u32 = (31 << 27) | 511;
+
+        // SAFETY: plain D3D12 resource/descriptor creation and mapped test
+        // buffers. Every command list is submitted before its resources drop.
+        unsafe {
+            initial_bytes.cast::<u32>().write_volatile(BRIGHT);
+            std::ptr::copy_nonoverlapping([65535u32, 65535, 1].as_ptr(), oversized_bytes.cast(), 3);
+            std::ptr::write_bytes(budget_bytes, 0, 256);
+            let mut texture = None;
+            warp.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 1,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_UINT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let heap: ID3D12DescriptorHeap = warp.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                },
+            ).unwrap();
+            warp.device.CreateUnorderedAccessView(
+                &texture,
+                None::<&ID3D12Resource>,
+                None,
+                heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let placed = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(resource),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let image = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            for dimensions in [Some([1u32, 1, 1]), Some([0, 1, 1]), Some([1, 0, 1]), Some([1, 1, 0]), None] {
+                let (buffer, at) = if let Some(dimensions) = dimensions {
+                    // Different record at 0 catches a stale or ignored byte offset.
+                    let alternate = if dimensions.contains(&0) { [1u32; 3] } else { [0u32; 3] };
+                    std::ptr::copy_nonoverlapping(alternate.as_ptr(), records_bytes.cast(), 3);
+                    std::ptr::copy_nonoverlapping(dimensions.as_ptr(), records_bytes.add(32).cast(), 3);
+                    warp.list.ResourceBarrier(&[transition(
+                        &records, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                    (records.clone(), 32)
+                } else {
+                    warp.clamp_dispatch(&oversized, budget, &clamped);
+                    (clamped.clone(), 0)
+                };
+                let args = IndirectHold { buffer: &buffer, at };
+                let list = &warp.list;
+                list.CopyTextureRegion(&image, 0, 0, 0, &placed(&initial), None);
+                list.ResourceBarrier(&[transition(
+                    &texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.SetComputeRootSignature(root);
+                list.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+                list.SetComputeRootDescriptorTable(2, heap.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+                args.run(list, pso, [1, 1]);
+                list.ResourceBarrier(&[transition(
+                    &texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyTextureRegion(&placed(&readback), 0, 0, 0, &image, None);
+                if dimensions.is_none() {
+                    list.ResourceBarrier(&[transition(
+                        &buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    list.CopyBufferRegion(&readback, 16, &buffer, 0, 12);
+                }
+                list.ResourceBarrier(&[transition(
+                    &texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                warp.submit_and_wait();
+                let texel = readback_bytes.cast::<u32>().read_volatile();
+                let empty = dimensions.is_none_or(|d| d.contains(&0));
+                assert_eq!(texel == BRIGHT, empty, "dispatch dimensions {dimensions:?}");
+                if dimensions.is_none() {
+                    let clamped = std::slice::from_raw_parts(readback_bytes.add(16).cast::<u32>(), 3);
+                    assert_eq!(clamped, [0; 3], "the GPU clamp zeroed the input grid");
+                }
+            }
+            if debug {
+                let queue: ID3D12InfoQueue = warp.device.cast().expect("the D3D12 info queue");
+                let mut severities = [D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR];
+                let filter = D3D12_INFO_QUEUE_FILTER {
+                    AllowList: D3D12_INFO_QUEUE_FILTER_DESC {
+                        NumSeverities: severities.len() as u32,
+                        pSeverityList: severities.as_mut_ptr(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                queue.PushRetrievalFilter(&filter).unwrap();
+                assert_eq!(queue.GetNumStoredMessagesAllowedByRetrievalFilter(), 0, "D3D12 debug layer errors");
+                queue.PopRetrievalFilter();
+            }
+        }
     }
 
     #[test]
